@@ -1,0 +1,112 @@
+#cocotb testbench
+import cocotb
+import os
+from cocotb.clock    import Clock
+from cocotb.triggers import RisingEdge, ClockCycles
+from tests.uart_gen  import generate_test_cases, generate_fifo_stress
+
+CLK_PERIOD_NS = 20
+
+async def reset_dut(dut):
+    dut.rst.value       = 1
+    dut.wr_enable.value = 0
+    dut.rd_enable.value = 0
+    dut.data_in.value   = 0
+    dut.rx.value        = 1
+    await ClockCycles(dut.clk, 5)
+    dut.rst.value = 0
+    await ClockCycles(dut.clk, 2)
+
+async def uart_write(dut, byte_val):
+    dut.data_in.value   = byte_val
+    dut.wr_enable.value = 1
+    await RisingEdge(dut.clk)
+    dut.wr_enable.value = 0
+    await RisingEdge(dut.clk)
+
+async def uart_read(dut):
+    dut.rd_enable.value = 1
+    await RisingEdge(dut.clk)
+    dut.rd_enable.value = 0
+    await RisingEdge(dut.clk)
+    return int(dut.data_out.value)
+
+async def wait_for_rx(dut, timeout_cycles=20000):
+    for _ in range(timeout_cycles):
+        await RisingEdge(dut.clk)
+        if int(dut.rx_empty.value) == 0:
+            return True
+    return False
+
+@cocotb.test()
+async def test_reset(dut):
+    """Check all outputs are clean after reset"""
+    cocotb.start_soon(Clock(dut.clk, CLK_PERIOD_NS, unit="ns").start())
+    await reset_dut(dut)
+    assert int(dut.tx_out.value)   == 1, "tx_out should idle HIGH"
+    assert int(dut.tx_full.value)  == 0, "tx_full should be 0 after reset"
+    assert int(dut.rx_empty.value) == 1, "rx_empty should be 1 after reset"
+    dut._log.info("PASS — Reset Test")
+
+@cocotb.test()
+async def test_loopback_single(dut):
+    """Transmit 0xA5, receive via loopback, compare"""
+    cocotb.start_soon(Clock(dut.clk, CLK_PERIOD_NS, unit="ns").start())
+    async def loopback():
+        while True:
+            await RisingEdge(dut.clk)
+            dut.rx.value = dut.tx_out.value
+    cocotb.start_soon(loopback())
+    await reset_dut(dut)
+    await uart_write(dut, 0xA5)
+    received = await wait_for_rx(dut, timeout_cycles=25000)
+    assert received, "TIMEOUT — RX FIFO never got data"
+    result = await uart_read(dut)
+    assert result == 0xA5, f"Expected 0xA5, got 0x{result:02X}"
+    dut._log.info("PASS — Single Byte Loopback")
+
+@cocotb.test()
+async def test_auto_generated(dut):
+    """Run all auto-generated edge + random cases"""
+    cocotb.start_soon(Clock(dut.clk, CLK_PERIOD_NS, unit="ns").start())
+    async def loopback():
+        while True:
+            await RisingEdge(dut.clk)
+            dut.rx.value = dut.tx_out.value
+    cocotb.start_soon(loopback())
+    test_cases = generate_test_cases(n_random=10)
+    pass_count = 0
+    for tc in test_cases:
+        await reset_dut(dut)
+        await uart_write(dut, tc["data"])
+        received = await wait_for_rx(dut, timeout_cycles=25000)
+        assert received, f"TIMEOUT on 0x{tc['data']:02X}"
+        result = await uart_read(dut)
+        assert result == tc["expected"], \
+            f"[{tc['category']}] Sent 0x{tc['data']:02X}, got 0x{result:02X}"
+        pass_count += 1
+        dut._log.info(f"PASS [{tc['category']}] 0x{tc['data']:02X}")
+    dut._log.info(f"Auto-gen: {pass_count}/{len(test_cases)} passed")
+
+@cocotb.test()
+async def test_fifo_full(dut):
+    """Write bytes continuously and detect tx_full assertion"""
+    cocotb.start_soon(Clock(dut.clk, CLK_PERIOD_NS, unit="ns").start())
+    await reset_dut(dut)
+
+    fifo_went_full = False
+    for i in range(16):
+        dut.data_in.value   = i
+        dut.wr_enable.value = 1
+        await RisingEdge(dut.clk)
+        dut.wr_enable.value = 0
+        await RisingEdge(dut.clk)
+        if int(dut.tx_full.value) == 1:
+            fifo_went_full = True
+            dut._log.info(f"tx_full asserted after {i+1} writes")
+            break
+
+    assert fifo_went_full, "tx_full never asserted after 16 writes"
+    dut._log.info("PASS — FIFO Full Test")
+
+
