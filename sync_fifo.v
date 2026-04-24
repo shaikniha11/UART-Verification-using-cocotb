@@ -1,3 +1,4 @@
+//SYNCHRONOUS FIFO (first-in first-out)
 module sync_fifo(
   input  logic       clk,
   input  logic       rst,
